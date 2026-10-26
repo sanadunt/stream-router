@@ -162,6 +162,7 @@ docker compose up -d
 | `MEDIAMTX_VERSION` | Versi binary yang dipin; default `v1.19.2`. |
 | `MEDIAMTX_CONFIG_PATH` | Lokasi YAML global hasil generate atomik. |
 | `MEDIAMTX_READY_TIMEOUT_MS` | Batas tunggu setiap percobaan ingest sebelum masuk retry; default 15 detik. |
+| `MEDIAMTX_WEBRTC_PUBLIC_URL` | Opsional. Base URL HTTPS player WebRTC di balik reverse proxy, mis. `https://webrtc.example.com`; wajib bila dashboard dibuka lewat HTTPS. Kosong berarti `http://<public host>:18889`. Lihat [docs/DOCKER.md](docs/DOCKER.md#reverse-proxy-https). |
 | `RECORDING_PATH` | Root recording aktif; path lama tetap dicatat per segment. |
 | `AUTH_SECRET` | HMAC session, minimal 32 karakter. |
 | `APP_ENCRYPTION_KEY` | Key enkripsi URL, minimal 32 karakter dan harus persisten. |
