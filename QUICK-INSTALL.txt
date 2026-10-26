@@ -1,0 +1,54 @@
+STREAM ROUTER - INSTALASI CEPAT (LINUX PRODUCTION)
+===================================================
+
+Jalankan sebagai user non-root yang memiliki sudo. Untuk user service khusus
+tanpa sudo (mis. streamrouter), ikuti docs/DEPLOYMENT.md bagian 1.
+
+1. Extract ZIP dan masuk ke folder:
+   cd stream-router
+
+2. Pastikan Node.js 20+, npm, FFmpeg, dan PM2 tersedia:
+   node --version
+   npm --version
+   ffmpeg -version
+   pm2 --version || sudo npm install -g pm2
+
+3. Siapkan environment (file hanya dapat dibaca user ini):
+   install -m 600 .env.example .env
+   npm run secrets:generate
+   nano .env
+
+   WAJIB diisi:
+   - AUTH_SECRET dan APP_ENCRYPTION_KEY (salin dari secrets:generate)
+   - ADMIN_PASSWORD dan OPERATOR_PASSWORD (minimal 8 karakter)
+   - CORS_ORIGIN = origin HTTPS dashboard, mis. https://stream.example.com
+   - TRUST_PROXY=true bila memakai reverse proxy Nginx
+
+4. Jalankan installer:
+   ./scripts/install-production.sh
+
+   Installer menolak .env yang masih berisi nilai contoh, menerapkan permission
+   (data/ 700, .env dan database 600), menjalankan npm ci, migration, MediaMTX,
+   build, validasi .env dengan schema API (verify:env), smoke test FFmpeg, dan
+   boot uji build production (verify:dist), memasang service systemd MediaMTX,
+   menjalankan PM2 beserta boot service-nya (pm2 startup), lalu menunggu
+   /api/ready.
+
+5. Pasang reverse proxy HTTPS (Nginx) ke http://127.0.0.1:3000 sesuai
+   docs/DEPLOYMENT.md bagian 4, lalu buka:
+   https://stream.example.com
+
+   Jangan membuka http://IP-SERVER:3000 langsung: API hanya listen di
+   127.0.0.1, cookie login production bersifat Secure (wajib HTTPS), dan
+   request dari origin selain CORS_ORIGIN ditolak.
+
+6. Periksa:
+   pm2 status
+   systemctl is-enabled pm2-$(id -un)
+   sudo systemctl status mediamtx
+   curl -sS http://127.0.0.1:3000/api/ready
+
+   {"ready":false,"failing":[...]} menyebut pemeriksaan yang gagal; detailnya
+   ada di pm2 logs stream-router ("Pemeriksaan kesiapan gagal").
+
+Untuk upgrade, backup, firewall, dan troubleshooting, baca README.md dan folder docs/.

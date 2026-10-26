@@ -1,0 +1,58 @@
+# Context build Docker hanya berisi source. Dependency, hasil build, binary MediaMTX, data runtime,
+# dan secret tidak boleh ikut: image membangun ulang semuanya untuk arsitektur target.
+
+# Dependency dan hasil build (dibangun ulang di stage build)
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.runtime
+
+# Data runtime, log, backup, dan recording lokal
+data
+backups
+**/*.db
+**/*.db-journal
+**/*.db-shm
+**/*.db-wal
+**/*.log
+
+# Secret dan konfigurasi lokal (.env.example juga tidak dibutuhkan image)
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.crt
+**/*.key
+**/*.pem
+
+# Metadata repo, editor, dan worktree agent
+.git
+.gitattributes
+.gitignore
+.github
+.claude
+.vscode
+.idea
+**/.DS_Store
+
+# Test, coverage, dan cache tooling
+coverage
+**/coverage
+**/.vite
+**/.vite-temp
+apps/api/tests
+packages/*/tests
+
+# Dokumentasi, file Docker/release, dan output release
+docs
+docker
+release
+*.md
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+*.zip
+*.tar
+*.tar.gz
+*.tgz

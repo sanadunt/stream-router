@@ -1,0 +1,182 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model StreamRoute {
+  id                String     @id @default(uuid())
+  cameraKey         String     @unique
+  name              String
+  description       String     @default("")
+  inputUrlEncrypted String
+  inputProtocol     String
+  outputsEncrypted  String
+  enabled           Boolean    @default(true)
+  autoStart         Boolean    @default(false)
+  localViewEnabled  Boolean    @default(false)
+  localAudioMode    String     @default("COPY")
+  onlineRelayEnabled Boolean   @default(true)
+  recordingEnabled  Boolean    @default(false)
+  recordingRetentionMode String @default("INHERIT")
+  recordingRetentionDays Int?
+  recordingRetentionGb Float?
+  ffmpegMode        String     @default("COPY")
+  onlineAudioMode   String     @default("COPY")
+  ffmpegOptions     String     @default("{}")
+  retryPolicy       String     @default("{}")
+  webrtcEnabled     Boolean    @default(false)
+  webrtcUrlEncrypted String?
+  webrtcMode        String     @default("IFRAME")
+  ptzEnabled        Boolean    @default(false)
+  ptzProvider       String     @default("NONE")
+  ptzZoomEnabled    Boolean    @default(false)
+  ptzConfigEncrypted String?
+  ptzMqttBrokerId   String?
+  mqttBridgeEnabled Boolean    @default(false)
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  runs              RouteRun[]
+  auditLogs         AuditLog[]
+  mqttBridgeSubscriptions RouteMqttBridgeSubscription[]
+  ptzMqttBroker     MqttBroker? @relation("StreamRoutePtzBroker", fields: [ptzMqttBrokerId], references: [id], onDelete: SetNull)
+  recordings        RecordingSegment[]
+
+  @@index([enabled, autoStart])
+  @@index([ptzMqttBrokerId])
+}
+
+model RecordingSegment {
+  id             String       @id @default(uuid())
+  routeId        String?
+  cameraKey      String
+  cameraName     String
+  storageRoot    String
+  relativePath   String
+  startTime      DateTime
+  endTime        DateTime
+  durationMs     Int
+  // REAL di SQLite: Int Prisma hanya 32-bit, sedangkan satu segment 1 jam bisa melewati 2 GiB.
+  sizeBytes      Float
+  status         String       @default("COMPLETE")
+  protected      Boolean      @default(false)
+  deletionReason String?
+  errorMessage   String?
+  deletedAt      DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  route          StreamRoute? @relation(fields: [routeId], references: [id], onDelete: SetNull)
+
+  @@unique([storageRoot, relativePath])
+  @@index([routeId, startTime])
+  @@index([cameraKey, startTime])
+  @@index([status, protected, startTime])
+}
+
+model MqttBroker {
+  id                String   @id @default(uuid())
+  name              String   @unique
+  description       String   @default("")
+  protocol          String   @default("mqtt")
+  host              String
+  port              Int      @default(1883)
+  path              String   @default("/mqtt")
+  rootTopic         String   @default("Turjawali")
+  username          String   @default("")
+  passwordEncrypted String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  subscriptions     RouteMqttBridgeSubscription[]
+  streamRoutePtzTargets StreamRoute[] @relation("StreamRoutePtzBroker")
+  webrtcPtzTargets  WebrtcStream[] @relation("WebrtcStreamPtzBroker")
+
+  @@index([name])
+}
+
+model RouteMqttBridgeSubscription {
+  id           String      @id @default(uuid())
+  routeId      String
+  brokerId     String
+  commandTopic String
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  route        StreamRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  broker       MqttBroker  @relation(fields: [brokerId], references: [id], onDelete: Cascade)
+
+  @@unique([routeId, brokerId])
+  @@unique([brokerId, commandTopic])
+  @@index([routeId])
+  @@index([brokerId])
+}
+
+model MonitoringLayout {
+  id        String   @id @default(uuid())
+  name      String
+  layout    String   @default("1") // "1", "2", "4", "8"
+  slots     String   @default("[]") // JSON array of { routeId, position }
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isDefault])
+}
+
+model WebrtcStream {
+  id           String   @id @default(uuid())
+  name         String
+  description  String   @default("")
+  urlEncrypted String
+  mode         String   @default("IFRAME")
+  enabled      Boolean  @default(true)
+  ptzEnabled   Boolean  @default(false)
+  ptzProvider  String   @default("NONE")
+  ptzZoomEnabled Boolean @default(false)
+  ptzConfigEncrypted String?
+  ptzMqttBrokerId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  ptzMqttBroker MqttBroker? @relation("WebrtcStreamPtzBroker", fields: [ptzMqttBrokerId], references: [id], onDelete: SetNull)
+
+  @@index([enabled, name])
+  @@index([ptzMqttBrokerId])
+}
+
+model RouteRun {
+  id           String      @id @default(uuid())
+  routeId      String
+  pid          Int?
+  status       String
+  startedAt    DateTime?
+  stoppedAt    DateTime?
+  exitCode     Int?
+  signal       String?
+  restartCount Int         @default(0)
+  lastError    String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  route        StreamRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
+
+  @@index([routeId, createdAt])
+}
+
+model AppSetting {
+  key       String   @id
+  value     String
+  isSecret  Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id           String       @id @default(uuid())
+  action       String
+  routeId      String?
+  metadataJson String       @default("{}")
+  createdAt    DateTime     @default(now())
+  route        StreamRoute? @relation(fields: [routeId], references: [id], onDelete: SetNull)
+
+  @@index([routeId, createdAt])
+  @@index([action, createdAt])
+}

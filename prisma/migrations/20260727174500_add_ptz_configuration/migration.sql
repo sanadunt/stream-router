@@ -1,0 +1,9 @@
+ALTER TABLE "StreamRoute" ADD COLUMN "ptzEnabled" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "StreamRoute" ADD COLUMN "ptzProvider" TEXT NOT NULL DEFAULT 'NONE';
+ALTER TABLE "StreamRoute" ADD COLUMN "ptzZoomEnabled" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "StreamRoute" ADD COLUMN "ptzConfigEncrypted" TEXT;
+
+ALTER TABLE "WebrtcStream" ADD COLUMN "ptzEnabled" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "WebrtcStream" ADD COLUMN "ptzProvider" TEXT NOT NULL DEFAULT 'NONE';
+ALTER TABLE "WebrtcStream" ADD COLUMN "ptzZoomEnabled" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "WebrtcStream" ADD COLUMN "ptzConfigEncrypted" TEXT;

@@ -1,0 +1,1 @@
+ALTER TABLE "StreamRoute" ADD COLUMN "description" TEXT NOT NULL DEFAULT '';

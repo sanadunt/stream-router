@@ -1,0 +1,78 @@
+# Camera Integration (stream-router) dalam satu container: dashboard + API, MediaMTX, dan FFmpeg.
+#
+#   1. Salin docker/.env.example menjadi .env di folder ini, lalu isi password dan HOST_LAN_IP
+#      (di Windows: jalankan windows\setup.ps1 dari paket release).
+#   2. docker compose pull && docker compose up -d      (image dari GHCR)
+#      docker compose up -d --build                      (build lokal dari source repo ini)
+#   3. Buka http://<HOST_LAN_IP>:3000 dari komputer lain di LAN.
+#
+# Port host dipublikasikan di ${BIND_ADDRESS:-0.0.0.0}; isi BIND_ADDRESS=127.0.0.1 di .env bila hanya
+# boleh diakses dari komputer ini. Port MediaMTX harus sama dengan Settings → MediaMTX & Recording.
+name: stream-router
+
+services:
+  stream-router:
+    image: ${STREAM_ROUTER_IMAGE:-ghcr.io/sanadunt/stream-router:latest}
+    build: .
+    container_name: stream-router
+    restart: unless-stopped
+    env_file: .env
+    # Nilai di bawah menimpa .env. Path, port internal, dan NODE_ENV tetap agar sesuai volume dan
+    # mapping port; nilai ${...} masih dapat diubah dari .env.
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      DATABASE_URL: file:/app/data/stream-router.db
+      MEDIAMTX_ENABLED: "true"
+      MEDIAMTX_CONFIG_PATH: data/mediamtx/mediamtx.yml
+      RECORDING_PATH: /recordings
+      FFMPEG_PATH: ffmpeg
+      MEDIAMTX_PUBLIC_HOST: ${HOST_LAN_IP:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      PUBLIC_APP_NAME: ${PUBLIC_APP_NAME:-Camera Integration}
+      TZ: ${TZ:-Asia/Jakarta}
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:3000:3000/tcp"     # dashboard + API
+      - "${BIND_ADDRESS:-0.0.0.0}:18889:18889/tcp"   # WebRTC (WHEP)
+      - "${BIND_ADDRESS:-0.0.0.0}:18189:18189/udp"   # WebRTC ICE
+      - "${BIND_ADDRESS:-0.0.0.0}:18554:18554/tcp"   # RTSP
+      - "${BIND_ADDRESS:-0.0.0.0}:18888:18888/tcp"   # HLS
+      - "${BIND_ADDRESS:-0.0.0.0}:11935:11935/tcp"   # RTMP
+      - "${BIND_ADDRESS:-0.0.0.0}:18890:18890/udp"   # SRT
+    volumes:
+      # Database SQLite, log, config MediaMTX, dan secret otomatis (data/secrets). Wajib di-backup.
+      - stream-router-data:/app/data
+      # Recording fMP4. Jangan mengubah baris ini untuk bind mount: file ini ditimpa setiap update.
+      # Untuk menyimpan di folder Windows/host, tulis bind mount di docker-compose.override.yml di
+      # samping file ini (dibaca Compose, setup.ps1, dan update.ps1 otomatis), mis.
+      #   services:
+      #     stream-router:
+      #       volumes:
+      #         - type: bind
+      #           source: D:/StreamRouter/recordings
+      #           target: /recordings
+      # Lebih lambat daripada volume Docker; lihat "Recording di folder Windows" di README-WINDOWS.md
+      # (docs/WINDOWS.md di repository) atau "Volume dan path" di docs/DOCKER.md.
+      - stream-router-recordings:/recordings
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/api/health', { signal: AbortSignal.timeout(4000) }).then((response) => process.exit(response.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Supervisor menghentikan API (maks. 20 detik) lalu MediaMTX (maks. 8 detik).
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  stream-router-data:
+    name: stream-router-data
+  stream-router-recordings:
+    name: stream-router-recordings

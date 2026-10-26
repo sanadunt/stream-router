@@ -1,0 +1,260 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Pemeriksaan
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Image GHCR dan GitHub Release
+    needs: checks
+    runs-on: ubuntu-24.04
+    # Build linux/arm64 berjalan lewat emulasi QEMU.
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Versi dan nama image
+        id: vars
+        run: |
+          set -euo pipefail
+          pattern='^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?)$'
+          if [[ ! "$GITHUB_REF_NAME" =~ $pattern ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME bukan versi rilis vMAJOR.MINOR.PATCH[-prerelease]."
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            echo "version=$version"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/stream-router"
+            echo "prerelease=$prerelease"
+            echo "source_date_epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Metadata image
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.vars.outputs.prerelease == 'false' }}
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build dan push image multi-arch
+        id: push
+        uses: docker/build-push-action@v7
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.vars.outputs.source_date_epoch }}
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: |
+            type=gha,scope=release
+            type=gha,scope=ci-amd64
+          cache-to: type=gha,mode=max,scope=release
+
+      - name: Periksa manifest multi-arch
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          manifest="$(docker buildx imagetools inspect "$IMAGE:$VERSION")"
+          echo "$manifest"
+          for platform in linux/amd64 linux/arm64; do
+            if ! grep -Eq "Platform:[[:space:]]+${platform}\$" <<<"$manifest"; then
+              echo "::error::Image $IMAGE:$VERSION tidak memuat platform $platform."
+              exit 1
+            fi
+          done
+
+      # Layer diambil dari cache builder hasil langkah sebelumnya, jadi isinya sama dengan varian amd64
+      # di GHCR; SOURCE_DATE_EPOCH dan label yang sama menjaga konfigurasi image tetap sama.
+      - name: Image amd64 untuk instalasi offline
+        uses: docker/build-push-action@v7
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.vars.outputs.source_date_epoch }}
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          outputs: type=docker,dest=${{ runner.temp }}/stream-router-image.tar
+          cache-from: type=gha,scope=release
+
+      - name: Periksa dan kompres image offline
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/stream-router-image.tar"
+          docker load --input "$tarball"
+          platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE:$VERSION")"
+          if [[ "$platform" != "linux/amd64" ]]; then
+            echo "::error::Image offline berplatform $platform, bukan linux/amd64."
+            exit 1
+          fi
+          mkdir -p release
+          gzip -n -c "$tarball" > "release/stream-router-image-$VERSION-linux-amd64.tar.gz"
+          rm -f "$tarball"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Paket rilis Windows
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          SOURCE_DATE_EPOCH: ${{ steps.vars.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          npm run release:package -- "$VERSION"
+          zip="release/stream-router-docker-$VERSION.zip"
+          unzip -l "$zip"
+          bundle="$RUNNER_TEMP/release-bundle"
+          rm -rf "$bundle"
+          mkdir -p "$bundle"
+          unzip -q "$zip" -d "$bundle"
+          cp "$bundle/.env.example" "$bundle/.env"
+          printf '\nADMIN_PASSWORD=release-check-only\nOPERATOR_PASSWORD=release-check-only\nHOST_LAN_IP=127.0.0.1\n' >> "$bundle/.env"
+          images="$(docker compose --project-directory "$bundle" --file "$bundle/docker-compose.yml" config --images)"
+          if [[ "$images" != "$IMAGE:$VERSION" ]]; then
+            echo "::error::Image di docker-compose.yml paket rilis adalah '$images', bukan $IMAGE:$VERSION."
+            exit 1
+          fi
+          rm -rf "$bundle"
+
+      - name: SHA256SUMS.txt
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        working-directory: release
+        run: |
+          set -euo pipefail
+          sha256sum "stream-router-docker-$VERSION.zip" "stream-router-image-$VERSION-linux-amd64.tar.gz" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          PRERELEASE: ${{ steps.vars.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "release/stream-router-docker-$VERSION.zip"
+            "release/stream-router-image-$VERSION-linux-amd64.tar.gz"
+            "release/SHA256SUMS.txt"
+          )
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<'NOTES'
+          ## Instalasi di Windows (Docker Desktop)
+
+          1. Unduh `stream-router-docker-@VERSION@.zip`, lalu ekstrak ke folder tetap, misalnya `C:\stream-router`.
+          2. Di folder tersebut jalankan `powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\setup.ps1`. Panduan lengkap ada di `README-WINDOWS.md` di dalam zip.
+
+          Image Docker (linux/amd64 dan linux/arm64):
+
+          ```
+          docker pull @IMAGE@:@VERSION@
+          ```
+
+          Tanpa akses ke GHCR (amd64): unduh juga `stream-router-image-@VERSION@-linux-amd64.tar.gz`, lalu jalankan setup dengan `-ImageArchive .\stream-router-image-@VERSION@-linux-amd64.tar.gz` (setara `docker load -i`). Image yang dimuat bertag `@IMAGE@:@VERSION@`, sama dengan yang dipakai `docker-compose.yml` di zip.
+
+          Verifikasi unduhan dengan `SHA256SUMS.txt`, misalnya di PowerShell: `Get-FileHash .\stream-router-docker-@VERSION@.zip -Algorithm SHA256`.
+
+          NOTES
+          sed -i -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$IMAGE|g" "$notes"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME sudah ada; aset diunggah ulang."
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            # --notes (bukan --notes-file) adalah cara gh menaruh teks di atas catatan yang di-generate.
+            flags=(--verify-tag --title "Stream Router $GITHUB_REF_NAME" --notes "$(<"$notes")" --generate-notes)
+            if [[ "$PRERELEASE" == "true" ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${flags[@]}"
+          fi
+
+      - name: Ringkasan
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Rilis $GITHUB_REF_NAME"
+            echo
+            echo "- Image: \`$IMAGE:$VERSION\` (digest \`$DIGEST\`)"
+            while IFS= read -r tag; do
+              if [[ -n "$tag" ]]; then
+                echo "- Tag: \`$tag\`"
+              fi
+            done <<<"$TAGS"
+            echo
+            echo '```'
+            cat release/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

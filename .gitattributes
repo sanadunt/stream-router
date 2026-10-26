@@ -1,0 +1,35 @@
+# Semua file teks di-checkout dengan LF di setiap OS, termasuk Git for Windows (core.autocrlf=true).
+# Image yang dibangun dari checkout Windows (`setup.ps1 -Build`) harus berisi byte yang sama dengan
+# image CI: checksum migration, skrip, dan Dockerfile dipakai bergantian pada volume data yang sama.
+* text=auto eol=lf
+
+*.sql         text eol=lf
+*.prisma      text eol=lf
+*.toml        text eol=lf
+*.mjs         text eol=lf
+*.cjs         text eol=lf
+*.js          text eol=lf
+*.ts          text eol=lf
+*.tsx         text eol=lf
+*.json        text eol=lf
+*.sh          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.md          text eol=lf
+Dockerfile    text eol=lf
+.dockerignore text eol=lf
+.env.example  text eol=lf
+# Windows PowerShell 5.1 dan PowerShell 7 menjalankan skrip LF. LF juga membuat isi
+# windows/*.ps1 di paket rilis sama, di OS mana pun paket dibangun.
+*.ps1         text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.mp4  binary
+*.zip  binary
+*.gz   binary
+*.tgz  binary

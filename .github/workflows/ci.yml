@@ -1,0 +1,525 @@
+name: CI
+
+on:
+  push:
+    # Hanya branch: tag rilis menjalankan workflow ini lewat release.yml (workflow_call).
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install FFmpeg (smoke test)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -version | sed -n 1p
+
+      - name: Install dependency
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit test
+        run: npm test
+
+      - name: Integration test
+        run: npm run test:integration
+
+      - name: Verifikasi kontrak source
+        run: npm run verify:source
+
+      - name: Build production
+        run: npm run build
+
+      - name: Verifikasi dist (boot server production)
+        run: npm run verify:dist
+
+      - name: Smoke test FFmpeg
+        run: npm run smoke
+
+  docker:
+    name: Docker image linux/amd64 (smoke test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CI_IMAGE: stream-router:ci
+      CI_VERSION: 0.0.0-ci
+      COMPOSE_PROJECT_NAME: stream-router-ci
+      BASE_URL: http://127.0.0.1:3000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Volume Docker, termasuk /recordings milik container uji, berada di disk root runner yang juga
+      # menampung hasil build image. Toolchain bawaan runner yang tidak dipakai job ini dihapus agar
+      # storage guard recording di container sebisa mungkin tidak mem-pause recording karena disk runner.
+      - name: Kosongkan ruang disk runner
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          docker_root="$(docker info --format '{{.DockerRootDir}}')"
+          df -h / "$docker_root"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h / "$docker_root"
+
+      # package-release.mjs tidak memakai dependency npm, jadi npm ci tidak diperlukan di job ini.
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image linux/amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.CI_IMAGE }}
+          cache-from: type=gha,scope=ci-amd64
+          cache-to: type=gha,mode=max,scope=ci-amd64
+
+      - name: Periksa user image
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect --format '{{.Config.User}}' "$CI_IMAGE")"
+          if [[ -z "$user" || "$user" == "root" || "$user" == "0" || "$user" == root:* || "$user" == 0:* ]]; then
+            echo "::error::Image harus berjalan sebagai user non-root (Config.User='$user')."
+            exit 1
+          fi
+          echo "Image berjalan sebagai user: $user"
+
+      # Container diuji lewat paket rilis Windows, sehingga compose yang sampai ke pengguna ikut teruji.
+      - name: Paket rilis (versi CI)
+        run: |
+          set -euo pipefail
+          npm run release:package -- "$CI_VERSION"
+          zip="release/stream-router-docker-$CI_VERSION.zip"
+          unzip -l "$zip"
+          bundle="$RUNNER_TEMP/bundle"
+          rm -rf "$bundle"
+          mkdir -p "$bundle"
+          unzip -q "$zip" -d "$bundle"
+          for file in docker-compose.yml .env.example windows/setup.ps1 windows/update.ps1 README-WINDOWS.md; do
+            if [[ ! -s "$bundle/$file" ]]; then
+              echo "::error::Paket rilis tidak memuat $file."
+              exit 1
+            fi
+          done
+
+      - name: Helper smoke test
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/smoke-helpers.sh" <<'HELPERS'
+          container_id() {
+            docker compose ps --all --quiet stream-router
+          }
+
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+
+          # Menunggu healthcheck compose; gagal cepat bila container berhenti atau di-restart Docker.
+          wait_healthy() {
+            local timeout="$1" cid status running restarts deadline
+            cid="$(container_id)"
+            [[ -n "$cid" ]] || fail "Container stream-router tidak ditemukan."
+            deadline=$((SECONDS + timeout))
+            while :; do
+              status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")"
+              running="$(docker inspect --format '{{.State.Running}}' "$cid")"
+              restarts="$(docker inspect --format '{{.RestartCount}}' "$cid")"
+              [[ "$status" != "none" ]] || fail "Container tidak memiliki healthcheck."
+              [[ "$restarts" == "0" ]] || fail "Container di-restart Docker $restarts kali; proses utama berhenti tak terduga."
+              [[ "$running" == "true" ]] || fail "Container berhenti sebelum healthy."
+              if [[ "$status" == "healthy" ]]; then
+                echo "Container healthy."
+                return 0
+              fi
+              (( SECONDS < deadline )) || fail "Container belum healthy setelah $timeout detik (status: $status)."
+              sleep 3
+            done
+          }
+
+          # http_status <file-output> <argumen curl...>: mencetak kode HTTP, 000 bila koneksi gagal.
+          http_status() {
+            local output="$1"
+            shift
+            curl --silent --show-error --max-time 10 --output "$output" --write-out '%{http_code}' "$@" || true
+          }
+
+          # Ruang kosong disk runner; volume Docker (termasuk /recordings) berada di DockerRootDir.
+          print_disk_usage() {
+            local docker_root
+            docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+            df -h / ${docker_root:+"$docker_root"} || true
+          }
+
+          # admin_login <cookie-jar>: login Administrator memakai ADMIN_PASSWORD dari .env bundle.
+          admin_login() {
+            local jar="$1" password code
+            password="$(sed -n 's/^ADMIN_PASSWORD=//p' .env | tail -n 1)"
+            code="$(printf '{"role":"admin","password":"%s"}' "$password" \
+              | http_status /dev/null --cookie-jar "$jar" \
+                -H 'content-type: application/json' -H "origin: $BASE_URL" --data-binary @- "$BASE_URL/api/auth/login")"
+            [[ "$code" == "200" ]] || fail "Login admin untuk laporan /api/ready gagal (HTTP $code)."
+          }
+
+          # wait_ready <cookie-jar> <timeout>: menunggu database, FFmpeg, dan MediaMTX sehat menurut laporan
+          # lengkap /api/ready (sesi admin). Mengisi READY_STATE (ok atau storage-paused) dan READY_DETAIL.
+          wait_ready() {
+            local jar="$1" timeout="$2" code result deadline
+            deadline=$((SECONDS + timeout))
+            while :; do
+              code="$(http_status "$RUNNER_TEMP/ready.json" --cookie "$jar" "$BASE_URL/api/ready")"
+              result="$(node "$RUNNER_TEMP/ready-check.cjs" full "$code" "$RUNNER_TEMP/ready.json")"
+              READY_STATE="${result%% *}"
+              READY_DETAIL="${result#* }"
+              if [[ "$READY_STATE" != "wait" ]]; then
+                echo "/api/ready: $READY_DETAIL"
+                return 0
+              fi
+              if (( SECONDS >= deadline )); then
+                print_disk_usage
+                fail "/api/ready belum siap setelah $timeout detik: $READY_DETAIL"
+              fi
+              sleep 3
+            done
+          }
+          HELPERS
+
+          # node ready-check.cjs full|anonymous <kode-http> <file-json>; mencetak satu baris "<status> <keterangan>".
+          # full (laporan lengkap sesi admin): ok, storage-paused, atau wait.
+          # anonymous (tanpa sesi): ok atau error.
+          cat > "$RUNNER_TEMP/ready-check.cjs" <<'NODE'
+          "use strict";
+          const fs = require("node:fs");
+          const [mode, code, file] = process.argv.slice(2);
+          const say = (state, text) => {
+            console.log(`${state} ${text}`);
+            process.exit(0);
+          };
+          const notReady = mode === "full" ? "wait" : "error";
+          if (code === "000") say(notReady, "API tidak dapat dihubungi");
+          let body = null;
+          try {
+            body = JSON.parse(fs.readFileSync(file, "utf8"));
+          } catch {
+            body = null;
+          }
+          if (body === null || typeof body !== "object") say(notReady, `HTTP ${code}, respons bukan JSON`);
+
+          if (mode === "anonymous") {
+            // Pemanggil anonim hanya boleh menerima status ringkas dan nama pemeriksaan yang gagal.
+            const keys = Object.keys(body).sort().join(",");
+            const failing = JSON.stringify(body.failing);
+            if (code === "200" && keys === "ready" && body.ready === true) say("ok", "/api/ready anonim HTTP 200 tanpa detail");
+            if (code === "503" && keys === "failing,ready" && body.ready === false && failing === '["mediaMtx.recordingStorage"]') {
+              say("ok", `/api/ready anonim HTTP 503 tanpa detail, failing ${failing}`);
+            }
+            say("error", `/api/ready anonim menjawab HTTP ${code}: ${JSON.stringify(body)}`);
+          }
+
+          const report = body.checks;
+          if (!report || typeof report !== "object") say("wait", `HTTP ${code} tanpa laporan lengkap; sesi admin tidak dikenali`);
+          const problems = [];
+          const check = (name, value) => {
+            if (value?.ok === true) return;
+            problems.push(typeof value?.error === "string" && value.error ? `${name} (${value.error})` : name);
+          };
+          check("database", report.database);
+          check("ffmpeg", report.ffmpeg);
+          const mediaMtx = report.mediaMtx ?? {};
+          const storage = mediaMtx.recordingStorage ?? {};
+          if (mediaMtx.enabled !== true) {
+            problems.push("MediaMTX tidak aktif");
+          } else {
+            check(mediaMtx.controlApi ? "mediaMtx.controlApi" : "mediaMtx", mediaMtx.controlApi ?? mediaMtx);
+            // statfs /recordings yang gagal (volume tidak ter-mount atau tidak dapat dibaca) tetap kegagalan.
+            check("mediaMtx.recordingStorage", storage);
+          }
+          if (problems.length) say("wait", `HTTP ${code}, belum sehat: ${problems.join(", ")}`);
+          const ffmpegVersion = String(report.ffmpeg.version ?? "ffmpeg").split(" ").slice(0, 3).join(" ");
+          const healthy = `database, FFmpeg (${ffmpegVersion}), dan Control API MediaMTX sehat`;
+          if (code === "200" && body.ready === true && report.ok === true) say("ok", `HTTP 200; ${healthy}`);
+          if (code === "503" && body.ready === false && storage.paused === true) {
+            const gib = (bytes) => `${(Number(bytes) / 1024 ** 3).toFixed(1)} GiB`;
+            say("storage-paused", `HTTP 503; ${healthy}; ruang kosong /recordings ${gib(storage.freeBytes)} dari ${gib(storage.totalBytes)}`);
+          }
+          say("wait", `HTTP ${code}, ready=${String(body.ready)}, penyebab tidak dikenali`);
+          NODE
+
+      - name: Siapkan .env uji dan validasi compose
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          admin_password="$(openssl rand -hex 16)"
+          operator_password="$(openssl rand -hex 16)"
+          echo "::add-mask::$admin_password"
+          echo "::add-mask::$operator_password"
+          cp .env.example .env
+          # Key yang diisi ulang dihapus agar tidak terdefinisi ganda. AUTH_SECRET dan APP_ENCRYPTION_KEY
+          # sengaja dibiarkan seperti .env.example untuk menguji pembuatan secret otomatis oleh supervisor.
+          sed -i -E '/^[[:space:]]*(ADMIN_PASSWORD|OPERATOR_PASSWORD|HOST_LAN_IP|BIND_ADDRESS|STREAM_ROUTER_IMAGE)[[:space:]]*=/d' .env
+          printf '\nADMIN_PASSWORD=%s\nOPERATOR_PASSWORD=%s\nHOST_LAN_IP=127.0.0.1\nBIND_ADDRESS=127.0.0.1\n' \
+            "$admin_password" "$operator_password" >> .env
+
+          docker compose config --format json > "$RUNNER_TEMP/compose.json"
+          EXPECTED_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/stream-router:$CI_VERSION" \
+            node - "$RUNNER_TEMP/compose.json" <<'NODE'
+          const fs = require("node:fs");
+          const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const service = config.services?.["stream-router"];
+          const problems = [];
+          if (!service) {
+            problems.push("service stream-router tidak ada");
+          } else {
+            if (service.build) problems.push("key build masih ada");
+            if (service.image !== process.env.EXPECTED_IMAGE) problems.push(`image ${service.image} bukan ${process.env.EXPECTED_IMAGE}`);
+            const targets = (service.volumes ?? []).map((volume) => volume.target);
+            for (const target of ["/app/data", "/recordings"]) {
+              if (!targets.includes(target)) problems.push(`volume ${target} tidak ada`);
+            }
+            if (!service.healthcheck?.test?.length) problems.push("healthcheck tidak didefinisikan");
+            if (service.restart !== "unless-stopped") problems.push(`restart ${service.restart} bukan unless-stopped`);
+            if (service.stop_grace_period !== "30s") problems.push(`stop_grace_period ${service.stop_grace_period} bukan 30s`);
+            if (service.environment?.MEDIAMTX_PUBLIC_HOST !== "127.0.0.1") problems.push("MEDIAMTX_PUBLIC_HOST tidak diambil dari HOST_LAN_IP");
+          }
+          for (const problem of problems) console.log(`::error::docker-compose.yml paket rilis: ${problem}`);
+          if (problems.length) process.exit(1);
+          console.log("docker-compose.yml paket rilis sesuai kontrak.");
+          NODE
+
+          printf 'STREAM_ROUTER_IMAGE=%s\n' "$CI_IMAGE" >> .env
+          images="$(docker compose config --images)"
+          if [[ "$images" != "$CI_IMAGE" ]]; then
+            echo "::error::STREAM_ROUTER_IMAGE di .env tidak dipakai compose (didapat: $images)."
+            exit 1
+          fi
+
+      - name: Jalankan container
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-helpers.sh"
+          docker compose up --detach --pull never --no-build
+          wait_healthy 240
+
+      - name: Uji health, MediaMTX, FFmpeg, dan port
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-helpers.sh"
+          cid="$(container_id)"
+
+          code="$(http_status "$RUNNER_TEMP/health.json" "$BASE_URL/api/health")"
+          echo "/api/health HTTP $code: $(cat "$RUNNER_TEMP/health.json")"
+          [[ "$code" == "200" ]] || fail "/api/health menjawab HTTP $code, bukan 200."
+
+          # /api/ready memeriksa database, FFmpeg, dan MediaMTX sekaligus, termasuk storage guard recording.
+          # Volume /recordings berada di disk runner, jadi pause storage guard karena disk runner di bawah
+          # batas aman (default maks(15% disk, 20 GiB)) bukan cacat image: diterima dengan peringatan selama
+          # database, FFmpeg, Control API MediaMTX, dan statfs /recordings sehat.
+          ready_jar="$RUNNER_TEMP/ready-cookies.txt"
+          admin_login "$ready_jar"
+          wait_ready "$ready_jar" 120
+          if [[ "$READY_STATE" == "storage-paused" ]]; then
+            print_disk_usage
+            code="$(http_status "$RUNNER_TEMP/recording-storage.json" --cookie "$ready_jar" "$BASE_URL/api/recordings/storage")"
+            echo "/api/recordings/storage HTTP $code: $(cat "$RUNNER_TEMP/recording-storage.json" 2>/dev/null || true)"
+            echo "::warning::Storage guard mem-pause recording karena ruang kosong disk runner CI di bawah batas aman, sehingga /api/ready menjawab 503 (mediaMtx.recordingStorage). Diterima karena $READY_DETAIL."
+          fi
+          # Tanpa sesi, /api/ready hanya mengirim status ringkas dan nama pemeriksaan yang gagal.
+          code="$(http_status "$RUNNER_TEMP/ready-anonymous.json" "$BASE_URL/api/ready")"
+          result="$(node "$RUNNER_TEMP/ready-check.cjs" anonymous "$code" "$RUNNER_TEMP/ready-anonymous.json")"
+          [[ "${result%% *}" == "ok" ]] || fail "${result#* }"
+          echo "${result#* }"
+
+          docker exec "$cid" node -e '
+            fetch("http://127.0.0.1:19997/v3/paths/list", { signal: AbortSignal.timeout(5000) })
+              .then(async (response) => {
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const body = await response.json();
+                console.log(`MediaMTX Control API menjawab (${body.itemCount ?? 0} path).`);
+              })
+              .catch((error) => {
+                console.error(`MediaMTX Control API tidak menjawab: ${error.message}`);
+                process.exit(1);
+              });
+          '
+
+          pid1="$(docker exec "$cid" cat /proc/1/comm)"
+          [[ "$pid1" == tini* ]] || fail "PID 1 di container harus tini (didapat: $pid1)."
+
+          encoders="$(docker exec "$cid" ffmpeg -hide_banner -encoders)"
+          for encoder in libx264 aac libopus; do
+            grep -Eq "^[[:space:]]*[VAS][A-Z.]{5}[[:space:]]+${encoder}([[:space:]]|\$)" <<<"$encoders" \
+              || fail "FFmpeg di image tidak memiliki encoder $encoder."
+          done
+          protocols="$(docker exec "$cid" ffmpeg -hide_banner -protocols)"
+          output_protocols="${protocols#*Output:}"
+          for protocol in rtmp rtmps; do
+            grep -Eqx "[[:space:]]*${protocol}" <<<"$output_protocols" || fail "FFmpeg di image tidak mendukung output $protocol."
+          done
+          docker exec "$cid" ffmpeg -hide_banner -nostdin -loglevel error \
+            -f lavfi -i testsrc=size=320x240:rate=10 -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+            -t 1 -map 0:v -map 1:a -c:v libx264 -preset ultrafast -c:a aac -f flv -y /dev/null
+          docker exec "$cid" ffmpeg -hide_banner -nostdin -loglevel error \
+            -f lavfi -i sine=frequency=1000:sample_rate=48000 -t 1 -c:a libopus -b:a 64k -f null -
+          echo "FFmpeg di image: libx264, aac, libopus, rtmp, dan rtmps tersedia."
+
+          for port in 3000/tcp 18889/tcp 18189/udp 18554/tcp 18888/tcp 11935/tcp 18890/udp; do
+            mapping="$(docker port "$cid" "$port" || true)"
+            grep -qx "127.0.0.1:${port%/*}" <<<"$mapping" \
+              || fail "Port $port tidak dipublikasikan ke BIND_ADDRESS (didapat: '$mapping')."
+          done
+          for port in 19996/tcp 19997/tcp 19998/tcp; do
+            if docker port "$cid" "$port" >/dev/null 2>&1; then
+              fail "Port internal MediaMTX $port tidak boleh dipublikasikan."
+            fi
+          done
+          # docker-proxy menerima koneksi TCP walau tidak ada listener di container, jadi yang diuji
+          # adalah respons protokol MediaMTX, bukan sekadar koneksi.
+          for port in 18889 18888; do
+            code="$(http_status /dev/null "http://127.0.0.1:$port/")"
+            [[ "$code" != "000" ]] || fail "MediaMTX tidak menjawab di port HTTP $port yang dipublikasikan."
+          done
+          rtsp_reply="$(timeout 10 bash -c '
+            exec 3<>/dev/tcp/127.0.0.1/18554
+            printf "OPTIONS rtsp://127.0.0.1:18554/ RTSP/1.0\r\nCSeq: 1\r\n\r\n" >&3
+            head -n 1 <&3
+          ' || true)"
+          [[ "$rtsp_reply" == RTSP/1.0* ]] || fail "MediaMTX RTSP tidak menjawab di port 18554 yang dipublikasikan."
+          echo "Port dashboard, WebRTC (WHEP), HLS, dan RTSP menjawab dari host."
+
+      - name: Uji secret otomatis dan login dashboard lewat HTTP
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-helpers.sh"
+          cid="$(container_id)"
+
+          dir_mode="$(docker exec "$cid" stat -c '%a' /app/data/secrets)"
+          file_stat="$(docker exec "$cid" stat -c '%a %s' /app/data/secrets/stream-router.env)"
+          read -r file_mode file_size <<<"$file_stat"
+          [[ "$dir_mode" == "700" ]] || fail "Mode /app/data/secrets $dir_mode, seharusnya 700."
+          [[ "$file_mode" == "600" ]] || fail "Mode stream-router.env $file_mode, seharusnya 600."
+          (( file_size > 0 )) || fail "File secret yang dibuat otomatis kosong."
+
+          admin_password="$(sed -n 's/^ADMIN_PASSWORD=//p' .env | tail -n 1)"
+          jar="$RUNNER_TEMP/cookies.txt"
+          headers="$RUNNER_TEMP/login-headers.txt"
+          code="$(printf '{"role":"admin","password":"%s"}' "$admin_password" \
+            | http_status /dev/null --dump-header "$headers" --cookie-jar "$jar" \
+              -H 'content-type: application/json' -H "origin: $BASE_URL" --data-binary @- "$BASE_URL/api/auth/login")"
+          [[ "$code" == "200" ]] || fail "Login admin lewat HTTP gagal (HTTP $code)."
+          cookie="$(grep -i '^set-cookie: stream_router_session=' "$headers" || true)"
+          [[ -n "$cookie" ]] || fail "Login tidak mengirim cookie sesi."
+          if grep -qiE ';[[:space:]]*secure([[:space:]]*;|[[:space:]]*$)' <<<"$cookie"; then
+            fail "Cookie sesi memakai Secure di HTTP; browser LAN tidak akan menyimpannya (COOKIE_SECURE=auto)."
+          fi
+          code="$(http_status /dev/null --cookie "$jar" "$BASE_URL/api/auth/me")"
+          [[ "$code" == "200" ]] || fail "/api/auth/me dengan cookie sesi menjawab HTTP $code."
+
+          # Request mutasi dari origin yang sama dengan alamat dashboard diterima; origin asing ditolak.
+          code="$(http_status /dev/null --cookie "$jar" -X POST -H 'origin: http://evil.invalid' "$BASE_URL/api/auth/logout")"
+          [[ "$code" == "403" ]] || fail "Origin asing seharusnya ditolak 403 (didapat HTTP $code)."
+          code="$(http_status /dev/null --cookie "$jar" -X POST -H "origin: $BASE_URL" "$BASE_URL/api/auth/logout")"
+          [[ "$code" == "200" ]] || fail "Request dari origin yang sama ditolak (HTTP $code)."
+          echo "Login HTTP, cookie tanpa Secure, dan pemeriksaan origin sesuai."
+
+      - name: Uji restart (secret dan sesi tetap berlaku)
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-helpers.sh"
+          cid="$(container_id)"
+          before="$(docker exec "$cid" sha256sum /app/data/secrets/stream-router.env)"
+          docker compose restart stream-router
+          wait_healthy 240
+          after="$(docker exec "$cid" sha256sum /app/data/secrets/stream-router.env)"
+          [[ "$before" == "$after" ]] || fail "Secret di /app/data/secrets berubah setelah restart."
+          # Token sesi dari sebelum restart hanya valid bila AUTH_SECRET yang sama dipakai ulang.
+          code="$(http_status /dev/null --cookie "$RUNNER_TEMP/cookies.txt" "$BASE_URL/api/auth/me")"
+          [[ "$code" == "200" ]] || fail "Sesi dari sebelum restart ditolak (HTTP $code); AUTH_SECRET tidak dipakai ulang."
+          echo "Secret dan sesi tetap berlaku setelah restart."
+
+      - name: Uji docker stop (graceful shutdown)
+        working-directory: ${{ runner.temp }}/bundle
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-helpers.sh"
+          cid="$(container_id)"
+          docker stop -t 30 "$cid"
+          exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$cid")"
+          oom_killed="$(docker inspect --format '{{.State.OOMKilled}}' "$cid")"
+          docker logs "$cid" > "$RUNNER_TEMP/container.log" 2>&1
+          [[ "$oom_killed" == "false" ]] || fail "Container dihentikan karena kehabisan memori."
+          [[ "$exit_code" == "0" ]] || fail "docker stop berakhir dengan exit code $exit_code; shutdown tidak graceful."
+          # Satu dari restart di langkah sebelumnya, satu dari docker stop.
+          graceful="$(grep -c 'Graceful shutdown dimulai' "$RUNNER_TEMP/container.log" || true)"
+          (( graceful >= 2 )) || fail "Log tidak menunjukkan graceful shutdown API pada restart dan stop (ditemukan $graceful)."
+          echo "docker stop selesai dengan exit 0; graceful shutdown API tercatat $graceful kali."
+
+      - name: Log container (saat gagal)
+        if: failure()
+        run: |
+          docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+          df -h / ${docker_root:+"$docker_root"} || true
+          bundle="$RUNNER_TEMP/bundle"
+          if [[ ! -f "$bundle/.env" ]]; then
+            echo "Container belum dijalankan."
+            exit 0
+          fi
+          cd "$bundle"
+          docker compose ps --all || true
+          docker compose logs --no-color --timestamps --tail 500 || true
+
+      - name: Bersihkan container dan volume
+        if: always()
+        run: |
+          bundle="$RUNNER_TEMP/bundle"
+          if [[ -f "$bundle/.env" ]]; then
+            cd "$bundle"
+            docker compose down --volumes --remove-orphans || true
+          fi
