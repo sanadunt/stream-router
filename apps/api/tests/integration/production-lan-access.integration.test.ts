@@ -30,6 +30,8 @@ process.env.TRUST_PROXY = 'true';
 process.env.COOKIE_SECURE = 'auto';
 process.env.MEDIAMTX_ENABLED = 'false';
 process.env.MEDIAMTX_PUBLIC_HOST = '192.168.50.20';
+// Player WebRTC disajikan reverse proxy HTTPS di bawah sub-path (garis miring akhir dinormalisasi).
+process.env.MEDIAMTX_WEBRTC_PUBLIC_URL = 'https://kamera.example.com/webrtc/';
 process.env.MEDIAMTX_CONFIG_PATH = path.join(tmpRoot, 'mediamtx.yml');
 process.env.RECORDING_PATH = path.join(tmpRoot, 'recordings');
 process.env.LOG_LEVEL = 'silent';
@@ -266,6 +268,45 @@ describe('akses LAN mode production (Docker/Windows)', () => {
     await save('192.168.50.99');
     expect(await publicHost()).toBe('192.168.50.99');
     await prisma.appSetting.delete({ where: { key: 'mediamtx.publicHost' } });
+  });
+
+  it('MEDIAMTX_WEBRTC_PUBLIC_URL tampil di Settings dan menjadi dasar URL player WebRTC HTTPS', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: adminCookie } });
+    const mediaMtx = response.json().mediaMtx as { webrtcPublicUrl: string; publicHost: string; webrtcPort: number };
+    expect(mediaMtx.webrtcPublicUrl).toBe('https://kamera.example.com/webrtc');
+    const { localWebrtcUrl } = await import('../../src/modules/mediamtx/mediamtx-runtime.js');
+    expect(localWebrtcUrl(mediaMtx, 'cameras/gerbang')).toBe('https://kamera.example.com/webrtc/cameras/gerbang/');
+    // Field ini hanya dari env: endpoint yang menyimpan setting MediaMTX menolaknya walau payload lain valid.
+    const validApplyBody = {
+      enabled: false,
+      publicHost: '',
+      recordingPath: (response.json().mediaMtx as { recordingPath: string }).recordingPath,
+      rtspPort: 18554,
+      rtmpPort: 11935,
+      hlsPort: 18888,
+      webrtcPort: 18889,
+      webrtcUdpPort: 18189,
+      srtPort: 18890,
+      playbackPort: 19996,
+      apiPort: fakeMediaApiPort,
+      metricsPort: 19998,
+      retentionMode: 'DAYS',
+      retentionDays: 30,
+      retentionMaxGb: 100,
+      minFreePercent: 1,
+      minFreeGb: 1,
+      segmentDurationSeconds: 3600
+    };
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/api/settings/mediamtx/apply',
+      headers: { cookie: adminCookie, origin: corsOrigin },
+      payload: { ...validApplyBody, webrtcPublicUrl: 'https://attacker.example' }
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error.code).toBe('VALIDATION_ERROR');
+    const after = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: adminCookie } });
+    expect(after.json().mediaMtx.webrtcPublicUrl).toBe('https://kamera.example.com/webrtc');
   });
 
   it('Apply MediaMTX tidak membekukan MEDIAMTX_PUBLIC_HOST ke database dan publicHost dapat dikosongkan', async () => {

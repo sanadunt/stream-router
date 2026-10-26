@@ -131,9 +131,12 @@ function urlHost(host: string): string {
 }
 
 export function localWebrtcUrl(
-  settings: Pick<MediaMtxSettings, 'publicHost' | 'webrtcPort'>,
+  settings: Pick<MediaMtxSettings, 'publicHost' | 'webrtcPort'> & Partial<Pick<MediaMtxSettings, 'webrtcPublicUrl'>>,
   pathName: string
 ): string {
+  // Garis miring akhir mencegah redirect MediaMTX ke path absolut (`Location: /cameras/x/`) yang akan
+  // kehilangan prefix bila reverse proxy menyajikan WebRTC di bawah sub-path seperti /webrtc.
+  if (settings.webrtcPublicUrl) return `${settings.webrtcPublicUrl}/${pathName}/`;
   return `http://${urlHost(settings.publicHost)}:${settings.webrtcPort}/${pathName}`;
 }
 

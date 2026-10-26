@@ -568,6 +568,7 @@ export function SettingsPage({
       <div className="form-grid">
         <label className="check full"><input type="checkbox" checked={settings.mediaMtx.enabled} onChange={(event) => setSettings({ ...settings, mediaMtx: { ...settings.mediaMtx, enabled: event.target.checked } })} /> Aktifkan MediaMTX</label>
         <label>Public host/IP<input value={settings.mediaMtx.publicHostConfigured} placeholder={`Otomatis: ${settings.mediaMtx.publicHostDefault}`} onChange={(event) => setSettings({ ...settings, mediaMtx: { ...settings.mediaMtx, publicHostConfigured: event.target.value } })} /><small>Alamat IP/DNS server yang dapat dijangkau Viewer untuk WebRTC. Kosongkan agar mengikuti MEDIAMTX_PUBLIC_HOST (HOST_LAN_IP di Docker) atau deteksi otomatis IP LAN; nilai yang sama dengan nilai otomatis tidak disimpan. Dipakai sekarang: {settings.mediaMtx.publicHost}.</small></label>
+        <label>URL WebRTC publik<input value={settings.mediaMtx.webrtcPublicUrl || ''} placeholder={`http://${settings.mediaMtx.publicHost.includes(':') ? `[${settings.mediaMtx.publicHost}]` : settings.mediaMtx.publicHost}:${settings.mediaMtx.webrtcPort}`} readOnly /><small>Diatur lewat MEDIAMTX_WEBRTC_PUBLIC_URL di .env, mis. https://webrtc.example.com di balik reverse proxy HTTPS. Wajib bila dashboard dibuka lewat HTTPS agar video lokal tidak diblokir sebagai mixed content.</small></label>
         <label>Versi<input value={settings.mediaMtx.version} readOnly /></label>
         <label className="full">Folder recording
           <div className="input-actions">
