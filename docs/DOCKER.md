@@ -273,16 +273,26 @@ Workflow GitHub Actions ada di `.github/workflows/`:
 - `ci.yml` (push dan pull request): lint, typecheck, unit/integration test, `verify:source`, build, `verify:dist`, lalu build image `linux/amd64` dan uji container (health, Control API MediaMTX, encoder `libx264`/`libopus`, graceful stop).
 - `release.yml` (tag `v*.*.*`): pemeriksaan yang sama, push image multi-arch ke GHCR dengan tag `<versi>`, `<major>.<minor>`, dan `latest`, lalu membuat GitHub Release berisi `stream-router-docker-<versi>.zip`, image `amd64` (`docker save | gzip`), dan `SHA256SUMS.txt`.
 
-Remote `origin` proyek dapat berada di luar GitHub (mis. GitLab); workflow hanya berjalan di repository GitHub. Push branch dan tag ke remote GitHub:
+Repository utama adalah `github.com/sanadunt/stream-router`; perubahan masuk lewat pull request agar `ci.yml` berjalan sebelum merge:
 
 ```bash
-git remote add github git@github.com:sanadunt/stream-router.git   # sekali saja
-git push github main
-git tag -a v1.0.0 -m "Rilis 1.0.0"
-git push github v1.0.0
+git switch -c fitur/nama-perubahan origin/main
+# ... commit perubahan ...
+git push -u origin fitur/nama-perubahan
+gh pr create --fill          # atau buka PR dari halaman GitHub
 ```
 
-Package GHCR baru bersifat privat secara default. Agar pengguna Windows dapat `docker compose pull` tanpa login, buka GitHub → Packages → `stream-router` → *Package settings* → *Change visibility* → Public. Bila tetap privat, pengguna memerlukan `docker login ghcr.io` (token `read:packages`) atau file image offline dari halaman Release.
+Setelah PR di-merge dan CI di `main` hijau, buat rilis dari `main` dengan tag versi semver. Tag memicu `release.yml`:
+
+```bash
+git switch main && git pull --ff-only
+git tag -a v1.1.0 -m "Rilis 1.1.0"
+git push origin v1.1.0
+```
+
+Build `linux/arm64` berjalan lewat emulasi QEMU sehingga satu rilis memakan waktu cukup lama. Rilis yang gagal di tengah jalan dapat diulang dari tab Actions (*Re-run jobs*); tag yang sama tidak perlu dibuat ulang.
+
+Repository public menghasilkan package GHCR public, sehingga pengguna Windows dapat `docker compose pull` tanpa login. Bila repository dijadikan private, package ikut privat: pengguna memerlukan `docker login ghcr.io` (token `read:packages`) atau file image offline dari halaman Release.
 
 Membuat bundle zip secara lokal (tanpa image), mis. untuk memeriksa isinya:
 
