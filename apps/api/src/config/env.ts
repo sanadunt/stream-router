@@ -92,6 +92,33 @@ const publicHostValue = z.string().default('').transform((value, context) => {
   return z.NEVER;
 });
 
+// Base URL player WebRTC MediaMTX yang dilihat browser, mis. https://webrtc.example.com di balik reverse
+// proxy HTTPS. Tanpa ini URL selalu http://<publicHost>:<webrtcPort>, yang diblokir browser sebagai mixed
+// content saat dashboard dibuka lewat HTTPS. Kosong berarti tidak dipakai (string, agar aman bagi verify-dist).
+const webrtcPublicUrlValue = z.string().default('').transform((value, context) => {
+  const raw = value.trim();
+  if (!raw) return '';
+  // Host diperiksa dari teks yang diketik, karena parser URL mengubah IPv4 salah ketik (192.168.1, 0x7f.1)
+  // menjadi alamat lain tanpa error.
+  const typedHost = raw.replace(/^https?:\/\//i, '').split(/[/?#]/)[0]?.replace(/:\d*$/, '') ?? '';
+  const bareHost = typedHost.replace(/^\[(.*)\]$/, '$1');
+  const validHost = isIP(bareHost) > 0 || (hostnamePattern.test(typedHost) && !/(?:^|\.)\d+$/.test(typedHost));
+  try {
+    const url = new URL(raw);
+    if ((url.protocol === 'http:' || url.protocol === 'https:') && validHost && !url.username && !url.password
+      && !url.search && !url.hash && !/[?#]/.test(raw)) {
+      return `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+    }
+  } catch {
+    // ditangani di bawah
+  }
+  context.addIssue({
+    code: z.ZodIssueCode.custom,
+    message: 'Gunakan URL http(s) tanpa credential, query, atau fragment, mis. https://webrtc.example.com'
+  });
+  return z.NEVER;
+});
+
 // Hostname tambahan (tanpa skema dan port) yang boleh dipakai browser untuk membuka dashboard di
 // production, mis. nama komputer Windows atau nama .local. IP literal dan localhost selalu diterima.
 // Hasil parse berupa array; verify-dist menggabungkannya kembali dengan koma.
@@ -128,6 +155,7 @@ export const envSchema = z.object({
   MEDIAMTX_CONFIG_PATH: z.string().default('data/mediamtx/mediamtx.yml'),
   MEDIAMTX_READY_TIMEOUT_MS: z.coerce.number().int().min(100).max(120000).default(15000),
   MEDIAMTX_PUBLIC_HOST: publicHostValue,
+  MEDIAMTX_WEBRTC_PUBLIC_URL: webrtcPublicUrlValue,
   RECORDING_PATH: z.string().default('data/recordings'),
   AUTH_SECRET: secureValue('AUTH_SECRET', 32),
   APP_ENCRYPTION_KEY: secureValue('APP_ENCRYPTION_KEY', 32),

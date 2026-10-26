@@ -44,6 +44,8 @@ export interface MediaMtxSettings extends MediaMtxSettingsInput {
   apiUrl: string;
   rtspUrl: string;
   playbackUrl: string;
+  /** MEDIAMTX_WEBRTC_PUBLIC_URL tanpa garis miring akhir; '' = http://<publicHost>:<webrtcPort>. */
+  webrtcPublicUrl: string;
 }
 
 /**
@@ -183,6 +185,7 @@ export async function getMediaMtxSettings(): Promise<MediaMtxSettingsDetails> {
     rtmpPort: numeric(map, mediaKeys.rtmpPort, 11935),
     hlsPort: numeric(map, mediaKeys.hlsPort, 18888),
     webrtcPort: numeric(map, mediaKeys.webrtcPort, 18889),
+    webrtcPublicUrl: env.MEDIAMTX_WEBRTC_PUBLIC_URL,
     webrtcUdpPort: numeric(map, mediaKeys.webrtcUdpPort, 18189),
     srtPort: numeric(map, mediaKeys.srtPort, 18890),
     playbackPort,

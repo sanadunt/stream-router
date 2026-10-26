@@ -55,16 +55,50 @@ describe('validasi environment', () => {
     }
   });
 
-  it('nilai hasil parse COOKIE_SECURE dan MEDIAMTX_PUBLIC_HOST tetap sama bila di-String() lalu di-parse ulang', () => {
+  it('MEDIAMTX_WEBRTC_PUBLIC_URL menerima URL http(s) dengan atau tanpa sub-path dan menolak credential, query, atau fragment', () => {
+    expect(parse({}).MEDIAMTX_WEBRTC_PUBLIC_URL).toBe('');
+    expect(parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: ' ' }).MEDIAMTX_WEBRTC_PUBLIC_URL).toBe('');
+    expect(parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: 'https://WebRTC.Example.com' }).MEDIAMTX_WEBRTC_PUBLIC_URL)
+      .toBe('https://webrtc.example.com');
+    expect(parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: 'https://kamera.example.com/webrtc//' }).MEDIAMTX_WEBRTC_PUBLIC_URL)
+      .toBe('https://kamera.example.com/webrtc');
+    expect(parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: 'https://kamera.example.com:8443/' }).MEDIAMTX_WEBRTC_PUBLIC_URL)
+      .toBe('https://kamera.example.com:8443');
+    expect(parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: 'https://[fd00::10]:8443' }).MEDIAMTX_WEBRTC_PUBLIC_URL).toBe('https://[fd00::10]:8443');
+    for (const value of [
+      'webrtc.example.com',
+      // Parser URL mengubah IPv4 salah ketik menjadi alamat lain; ditolak seperti MEDIAMTX_PUBLIC_HOST.
+      'https://192.168.1',
+      'https://0x7f.1',
+      'ftp://webrtc.example.com',
+      'https://user:pass@webrtc.example.com',
+      'https://webrtc.example.com/?token=1',
+      'https://webrtc.example.com/?',
+      'https://webrtc.example.com/#x'
+    ]) {
+      expect(() => parse({ MEDIAMTX_WEBRTC_PUBLIC_URL: value }), value).toThrow(/tanpa credential, query, atau fragment/);
+    }
+  });
+
+  it('nilai hasil parse COOKIE_SECURE, MEDIAMTX_PUBLIC_HOST, dan MEDIAMTX_WEBRTC_PUBLIC_URL tetap sama bila di-String() lalu di-parse ulang', () => {
     // verify-dist mengisi setiap key env boot dengan String(nilai hasil parse schema).
-    for (const extra of [{}, { COOKIE_SECURE: 'auto' }, { COOKIE_SECURE: 'yes' }, { COOKIE_SECURE: 'off' }, { MEDIAMTX_PUBLIC_HOST: '[fd00::10]' }]) {
+    for (const extra of [
+      {},
+      { COOKIE_SECURE: 'auto' },
+      { COOKIE_SECURE: 'yes' },
+      { COOKIE_SECURE: 'off' },
+      { MEDIAMTX_PUBLIC_HOST: '[fd00::10]' },
+      { MEDIAMTX_WEBRTC_PUBLIC_URL: 'https://kamera.example.com/webrtc/' }
+    ]) {
       const first = parse(extra);
       const again = parse({
         COOKIE_SECURE: String(first.COOKIE_SECURE),
-        MEDIAMTX_PUBLIC_HOST: String(first.MEDIAMTX_PUBLIC_HOST)
+        MEDIAMTX_PUBLIC_HOST: String(first.MEDIAMTX_PUBLIC_HOST),
+        MEDIAMTX_WEBRTC_PUBLIC_URL: String(first.MEDIAMTX_WEBRTC_PUBLIC_URL)
       });
       expect(again.COOKIE_SECURE).toBe(first.COOKIE_SECURE);
       expect(again.MEDIAMTX_PUBLIC_HOST).toBe(first.MEDIAMTX_PUBLIC_HOST);
+      expect(again.MEDIAMTX_WEBRTC_PUBLIC_URL).toBe(first.MEDIAMTX_WEBRTC_PUBLIC_URL);
     }
   });
 

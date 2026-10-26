@@ -110,13 +110,81 @@ NODE_ENV=production
 HOST=127.0.0.1
 CORS_ORIGIN=https://stream-router.example.com
 TRUST_PROXY=true
+MEDIAMTX_WEBRTC_PUBLIC_URL=https://webrtc.example.com
 ```
 
 `TRUST_PROXY=true` hanya mempercayai proxy di host yang sama (127.0.0.1/::1). Bila nginx berada di host lain, isi IP/CIDR proxy tersebut, mis. `TRUST_PROXY=10.0.0.5`. Baris `X-Forwarded-For $remote_addr` wajib ada: header itu menimpa nilai kiriman client, sehingga rate limit login memakai IP client yang sebenarnya.
 
+`MEDIAMTX_WEBRTC_PUBLIC_URL` adalah base URL player WebRTC yang disajikan nginx (bagian berikut). Variabel ini hanya dibaca dari `.env` dan tampil read-only di Settings sebagai **URL WebRTC publik**. Setelah mengubah `.env`, jalankan `npm run verify:env` lalu `pm2 reload ecosystem.config.cjs --env production`.
+
+### WebRTC lewat HTTPS
+
+Dashboard memutar video lokal dengan memuat halaman player MediaMTX di dalam iframe. URL bawaan `http://<MEDIAMTX_PUBLIC_HOST>:18889/cameras/<cameraKey>` diblokir browser sebagai *mixed content* bila dashboard dibuka lewat HTTPS. Karena itu player juga disajikan lewat nginx, dan base URL-nya diisi di `MEDIAMTX_WEBRTC_PUBLIC_URL`; dashboard lalu memakai `<MEDIAMTX_WEBRTC_PUBLIC_URL>/cameras/<cameraKey>/`. Yang lewat nginx hanya halaman player dan signaling WHEP (`POST` offer, `PATCH` kandidat ICE, `DELETE` sesi). Media tetap mengalir langsung lewat `18189/UDP` ke `MEDIAMTX_PUBLIC_HOST`, jadi di VPS isi `MEDIAMTX_PUBLIC_HOST` (atau **Public host/IP** di Settings) dengan IP publik server.
+
+Terbitkan sertifikat untuk hostname WebRTC sebelum memasang virtual host-nya, karena nginx menolak start bila file `ssl_certificate` belum ada. Validasi HTTP-01 Let's Encrypt memerlukan port `80/tcp` yang dapat dijangkau dari internet (atau gunakan DNS-01):
+
+```bash
+sudo certbot certonly --nginx -d webrtc.example.com
+```
+
+Virtual host untuk hostname WebRTC:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name webrtc.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/webrtc.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/webrtc.example.com/privkey.pem;
+
+    # WHEP hanya membawa SDP offer dan kandidat ICE (beberapa KB).
+    client_max_body_size 64k;
+
+    location / {
+        # IP interface server, bukan 127.0.0.1 (lihat catatan di bawah).
+        proxy_pass http://203.0.113.10:18889;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+}
+```
+
+**Alternatif satu hostname**: tambahkan location berikut ke virtual host dashboard di atas, lalu isi `MEDIAMTX_WEBRTC_PUBLIC_URL=https://stream-router.example.com/webrtc`:
+
+```nginx
+    location /webrtc/ {
+        # Garis miring di akhir proxy_pass membuang prefix: /webrtc/cameras/<id>/ -> /cameras/<id>/.
+        proxy_pass http://203.0.113.10:18889/;
+        # Location dari MediaMTX berupa path absolut (/cameras/<id>/whep/<sesi>). Tanpa prefix
+        # ini, PATCH/DELETE sesi WHEP jatuh ke dashboard.
+        proxy_redirect / /webrtc/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        client_max_body_size 64k;
+    }
+```
+
+Dashboard selalu membuka player dengan garis miring di akhir (`.../cameras/<id>/`). Dengan begitu MediaMTX tidak mengirim redirect, dan `reader.js` serta endpoint `whep` di-resolve relatif terhadap sub-path.
+
+**Upstream bukan loopback.** Ganti `203.0.113.10` dengan IP interface server (`ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p'`). Jangan pakai `127.0.0.1`: MediaMTX memberi koneksi dari `127.0.0.1`/`::1` izin baca dan publish untuk semua path, karena izin itu dipakai relay FFmpeg dan transcode Opus. Bila nginx terhubung lewat loopback, setiap pengunjung ikut mendapat izin tersebut: kamera dengan Local Media OFF tetap dapat diputar, dan path `cameras/<id>/webrtc` dapat ditimpa lewat WHIP. Lewat IP interface, MediaMTX hanya menerapkan izin baca anonim per path. Port 18889 tetap tidak perlu dibuka di firewall, karena koneksi nginx ke IP server sendiri tidak keluar ke jaringan. Di Docker, upstream `127.0.0.1:18889` aman karena koneksi tiba di container dari IP gateway Docker ([DOCKER.md](DOCKER.md#reverse-proxy-https)).
+
+Verifikasi setelah `sudo nginx -t && sudo systemctl reload nginx`:
+
+- `curl -sS -o /dev/null -w '%{http_code}\n' https://webrtc.example.com/cameras/<cameraKey>/` menjawab `200` untuk route yang berjalan dengan Local Media ON; paling pasti, pakai **URL lokal** yang tampil di editor route. `401` berarti path itu tidak dibuka untuk baca anonim: Local Media OFF, atau route memakai audio lokal OPUS sehingga URL player-nya `.../cameras/<cameraKey>/webrtc/`. Gunakan GET, bukan `curl -I`, karena MediaMTX menjawab `HEAD` dengan `404`.
+- Sub-path: `curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' https://stream-router.example.com/webrtc/cameras/<cameraKey>` menjawab `302` ke `https://stream-router.example.com/webrtc/cameras/<cameraKey>/`.
+- Settings → MediaMTX & Recording menampilkan **URL WebRTC publik**, dan video lokal diputar tanpa peringatan *Mixed Content* di Console DevTools.
+
+Player MediaMTX tidak memeriksa sesi dashboard, dan Viewer tidak memakai password. Siapa pun yang dapat menjangkau 443 kedua hostname dapat menonton route dengan Local Media ON, termasuk langsung lewat `https://webrtc.example.com/cameras/<cameraKey>/`. Bila kamera tidak boleh ditonton publik, batasi 443 ke jaringan admin/Viewer atau VPN (lihat [DOCKER.md](DOCKER.md#siapa-yang-dapat-menonton)).
+
 ## 5. Firewall
 
-Control plane cukup membuka 443 dari jaringan admin. Port API tetap bind ke localhost. Untuk WebRTC lokal buka `18889/TCP` dan `18189/UDP` dari VLAN Viewer. Control API `19997`, playback `19996`, dan metrics `19998` tidak boleh dibuka dari localhost. Pastikan server dapat keluar menuju endpoint RTMP/RTMPS dan dapat menjangkau kamera.
+Control plane cukup membuka 443 dari jaringan admin, ditambah `80/tcp` dari internet bila sertifikat diterbitkan/diperpanjang lewat HTTP-01 Let's Encrypt. Port API tetap bind ke localhost. Untuk WebRTC lokal buka `18889/TCP` dan `18189/UDP` dari VLAN Viewer. Bila player disajikan nginx (`MEDIAMTX_WEBRTC_PUBLIC_URL`), Viewer cukup menjangkau `443/TCP` dan `18189/UDP`; `18889/TCP` tidak perlu dibuka. Control API `19997`, playback `19996`, dan metrics `19998` tidak boleh dibuka dari localhost. Pastikan server dapat keluar menuju endpoint RTMP/RTMPS dan dapat menjangkau kamera.
 
 ## 6. PM2
 

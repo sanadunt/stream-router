@@ -216,6 +216,8 @@ export interface MediaMtxSettings {
   publicHostConfigured: string;
   /** Host yang dipakai bila publicHostConfigured kosong. */
   publicHostDefault: string;
+  /** MEDIAMTX_WEBRTC_PUBLIC_URL (hanya dari env); '' = http://<publicHost>:<webrtcPort>. */
+  webrtcPublicUrl?: string;
   recordingPath: string;
   rtspPort: number;
   rtmpPort: number;
